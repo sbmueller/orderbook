@@ -24,7 +24,7 @@ fn main() {
     let mut order_book = order_book::OrderBook::new(output_sender, args.trade);
     let read_handle = thread::spawn(move || {
         process_input_orders(&args.file, order_sender)
-            .expect(&format!("Could not open file {}", &args.file.display()))
+            .unwrap_or_else(|_| panic!("Could not open file {}", &args.file.display()))
     });
     while let Ok(data) = order_receiver.recv() {
         order_book.add_order(data);
@@ -40,17 +40,27 @@ fn main() {
     read_handle.join().unwrap();
 }
 
+/// Read orders from a provided CSV file and send the content as `order::Order` to another thread,
+/// using the provided `sender`.
+///
+/// # Args
+/// * `path`: Handle for a CSV file containing orders
+/// * `sender`: MPSC sender to use for communicating orders
+///
+/// # Return
+/// A `Result` containing a `unit` or an `csv::Error`, if there is an issue with reading the
+/// provided CSV file.
 fn process_input_orders(
     path: &PathBuf,
     sender: Sender<order_book::order::Order>,
 ) -> Result<(), csv::Error> {
-    let mut rdr = csv::ReaderBuilder::new()
+    let mut reader = csv::ReaderBuilder::new()
         .comment(Some(b'#'))
         .has_headers(false)
         .flexible(true)
         .trim(csv::Trim::All)
         .from_path(path)?;
-    for result in rdr.records() {
+    for result in reader.records() {
         let record = result?;
         sender
             .send(order_book::order::Order::from(&record))

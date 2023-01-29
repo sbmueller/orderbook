@@ -5,7 +5,8 @@ use std::sync::mpsc::Sender;
 
 pub mod order;
 
-/// Struct to represent one order book consisting of an ask book and bid book.
+/// Struct to represent one order book consisting of an ask book and bid book. Every book stores a
+/// collection of `Order`s for a given price value.
 pub struct OrderBook {
     ask_book: BTreeMap<i32, Vec<order::Order>>,
     bid_book: BTreeMap<i32, Vec<order::Order>>,
@@ -20,6 +21,9 @@ impl OrderBook {
     ///
     /// # Args
     /// - `output_sender`: A mpsc sender used to send messages to the output thread
+    ///
+    /// # Return
+    /// A new `OrderBook` instance
     pub fn new(output_sender: Sender<String>, match_orders: bool) -> OrderBook {
         OrderBook {
             ask_book: BTreeMap::new(),
@@ -43,13 +47,20 @@ impl OrderBook {
         }
     }
 
+    // The following two functions show a high amount of duplication. It could make sense to
+    // refactor both into just one generalized function, either by introducing a conditional or
+    // accept more arguments that determine the behavior from outside.
+
     /// Updates the lowest_ask member and sends a message to the output thread if a change occurred
     fn update_lowest_ask(&mut self) {
+        // First bucket is also the one with the lowest price
         let lowest_bucket = self.ask_book.iter().next();
         match lowest_bucket {
             Some(bucket) => {
                 let price: i32 = *bucket.0;
+                // Accumulate volume over all orders in bucket
                 let volume: i32 = bucket.1.iter().map(|o| o.qty).sum();
+                // Check for top of book change
                 if self.lowest_ask.is_none()
                     || self.lowest_ask.unwrap().0 != price
                     || self.lowest_ask.unwrap().1 != volume
@@ -60,7 +71,9 @@ impl OrderBook {
                     self.lowest_ask = Some((price, volume));
                 }
             }
+            // There is no ask order in the books
             None => {
+                // Check if top of book was changed due to a matched order
                 if self.lowest_ask.is_some() {
                     self.log_sender.send("B, S, -, -".to_string()).unwrap();
                     self.lowest_ask = None;
@@ -71,11 +84,14 @@ impl OrderBook {
 
     /// Updates the highest_bid member and sends a message to the output thread if a change occurred
     fn update_highest_bid(&mut self) {
+        // Last bucket is also the one with highest price
         let highest_bucket = self.bid_book.iter().next_back();
         match highest_bucket {
             Some(bucket) => {
                 let price: i32 = *bucket.0;
+                // Accumulate volume over all orders in bucket
                 let volume: i32 = bucket.1.iter().map(|o| o.qty).sum();
+                // Check for top of book change
                 if self.highest_bid.is_none()
                     || self.highest_bid.unwrap().0 != price
                     || self.highest_bid.unwrap().1 != volume
@@ -86,7 +102,9 @@ impl OrderBook {
                     self.highest_bid = Some((price, volume));
                 }
             }
+            // There is no bid order in the books
             None => {
+                // Check if top of book was changed due to a matched order
                 if self.highest_bid.is_some() {
                     self.log_sender.send("B, B, -, -".to_string()).unwrap();
                     self.highest_bid = None;
@@ -95,10 +113,10 @@ impl OrderBook {
         }
     }
 
-    /// Process a new buy order
+    /// Process a new order
     ///
     /// # Args
-    /// - `order`: Order to be processed. Is assumed to be a buy order.
+    /// - `order`: Order to be processed
     fn new_user_order(&mut self, order: order::Order) {
         if !self.match_orders && self.crosses_the_book(&order) {
             self.log_sender
@@ -150,11 +168,7 @@ impl OrderBook {
     fn crosses_the_book(&self, order: &order::Order) -> bool {
         match order.side {
             order::Side::Buy => match self.get_lowest_ask() {
-                Some(la) => {
-                    let ge = order.price >= la;
-                    if self.match_orders && ge {}
-                    ge
-                }
+                Some(la) => order.price >= la,
                 None => false,
             },
             order::Side::Sell => match self.get_highest_bid() {
