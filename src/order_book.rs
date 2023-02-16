@@ -8,7 +8,9 @@ pub mod order;
 /// Struct to represent one order book consisting of an ask book and bid book. Every book stores a
 /// collection of `Order`s for a given price value.
 pub struct OrderBook {
+    /// Contains seller orders
     ask_book: BTreeMap<i32, Vec<order::Order>>,
+    /// Contains buyer orders
     bid_book: BTreeMap<i32, Vec<order::Order>>,
     lowest_ask: Option<(i32, i32)>,
     highest_bid: Option<(i32, i32)>,
@@ -41,15 +43,154 @@ impl OrderBook {
     /// - `order`: Order to be added
     pub fn add_order(&mut self, order: order::Order) {
         match order.kind {
-            order::Kind::New => self.new_user_order(order),
+            order::Kind::New => self.new_order(order),
             order::Kind::Cancel => self.cancel_order(order),
             order::Kind::Flush => self.flush(),
+        }
+    }
+
+    /// Process a new order
+    ///
+    /// # Args
+    /// - `order`: Order to be processed
+    fn new_order(&mut self, order: order::Order) {
+        // Reject orders if they cross the book
+        if !self.match_orders && self.crosses_the_book(&order) {
+            self.log_sender
+                .send(format!("R, {}, {}", &order.user, &order.user_order_id))
+                .unwrap();
+            return;
+        }
+        // Log acceptance
+        self.log_sender
+            .send(format!("A, {}, {}", &order.user, &order.user_order_id))
+            .unwrap();
+        // Match orders if configured
+        if self.match_orders
+            && match order.side {
+                order::Side::Buy => self.trade_buy_order(&order),
+                order::Side::Sell => self.trade_sell_order(&order),
+            }
+        {
+            return;
+        }
+        // If no matching was done, write into book
+        let inserter = |book: &mut BTreeMap<i32, Vec<order::Order>>, order: order::Order| {
+            let bucket = book.get_mut(&order.price);
+            match bucket {
+                Some(v) => v.push(order),
+                None => {
+                    book.insert(order.price, vec![order]);
+                }
+            }
+        };
+        match order.side {
+            order::Side::Buy => {
+                inserter(&mut self.bid_book, order);
+                self.update_highest_bid();
+            }
+            order::Side::Sell => {
+                inserter(&mut self.ask_book, order);
+                self.update_lowest_ask();
+            }
         }
     }
 
     // The following two functions show a high amount of duplication. It could make sense to
     // refactor both into just one generalized function, either by introducing a conditional or
     // accept more arguments that determine the behavior from outside.
+
+    /// Try to trade buy order
+    ///
+    /// # Args
+    /// - `buy_order`: Buy order offered to trade
+    ///
+    /// # Return
+    /// - True if trade was performed, false otherwise
+    fn trade_buy_order(&mut self, buy_order: &order::Order) -> bool {
+        let mut order_traded = false;
+        // TODO how to avoid key_to_be_removed?
+        let mut key_to_be_removed: Option<i32> = None;
+        if let Some(bucket) = self.ask_book.iter_mut().next() {
+            let sell_order_pos = bucket
+                .1
+                .iter()
+                // Only allowing full trades (quantity must match)
+                .position(|x| x.price <= buy_order.price && x.qty == buy_order.qty);
+            if let Some(pos) = sell_order_pos {
+                order_traded = true;
+                let sell_order = &bucket.1[pos];
+                // Log trade
+                self.log_sender
+                    .send(format!(
+                        "T, {}, {}, {}, {}, {}, {}",
+                        buy_order.user,
+                        buy_order.user_order_id,
+                        sell_order.user,
+                        sell_order.user_order_id,
+                        sell_order.price,
+                        sell_order.qty
+                    ))
+                    .unwrap();
+                bucket.1.remove(pos);
+                // If the last order in the bucket was deleted, remove the whole bucket
+                if bucket.1.is_empty() {
+                    key_to_be_removed = Some(*bucket.0);
+                }
+            }
+        }
+        if let Some(key) = key_to_be_removed {
+            self.ask_book.remove(&key);
+        }
+        self.update_lowest_ask();
+        order_traded
+    }
+
+    /// Try to trade sell order
+    ///
+    /// # Args
+    /// - `sell_order`: Buy order offered to trade
+    ///
+    /// # Return
+    /// - True if trade was performed, false otherwise
+    fn trade_sell_order(&mut self, sell_order: &order::Order) -> bool {
+        let mut order_traded = false;
+        // TODO how to avoid key_to_be_removed?
+        let mut key_to_be_removed: Option<i32> = None;
+        if let Some(bucket) = self.bid_book.iter_mut().next_back() {
+            let sell_order_pos = bucket
+                .1
+                .iter()
+                // Only allowing full trades (quantity must match)
+                .position(|x| x.price >= sell_order.price && x.qty == sell_order.qty);
+            if let Some(pos) = sell_order_pos {
+                order_traded = true;
+                let buy_order = &bucket.1[pos];
+                // Log trade
+                self.log_sender
+                    .send(format!(
+                        "T, {}, {}, {}, {}, {}, {}",
+                        buy_order.user,
+                        buy_order.user_order_id,
+                        sell_order.user,
+                        sell_order.user_order_id,
+                        sell_order.price,
+                        sell_order.qty
+                    ))
+                    .unwrap();
+                bucket.1.remove(pos);
+                // If the last order in the bucket was deleted, remove the whole bucket
+                if bucket.1.is_empty() {
+                    key_to_be_removed = Some(*bucket.0);
+                }
+            }
+        }
+        if let Some(key) = key_to_be_removed {
+            self.ask_book.remove(&key);
+        }
+        self.update_lowest_ask();
+        order_traded
+    }
 
     /// Updates the lowest_ask member and sends a message to the output thread if a change occurred
     fn update_lowest_ask(&mut self) {
@@ -113,51 +254,6 @@ impl OrderBook {
         }
     }
 
-    /// Process a new order
-    ///
-    /// # Args
-    /// - `order`: Order to be processed
-    fn new_user_order(&mut self, order: order::Order) {
-        if !self.match_orders && self.crosses_the_book(&order) {
-            self.log_sender
-                .send(format!("R, {}, {}", &order.user, &order.user_order_id))
-                .unwrap();
-            return;
-        }
-        self.log_sender
-            .send(format!("A, {}, {}", &order.user, &order.user_order_id))
-            .unwrap();
-        // Match orders if configured
-        if self.match_orders
-            && match order.side {
-                order::Side::Buy => self.trade_buy_order(&order),
-                order::Side::Sell => self.trade_sell_order(&order),
-            }
-        {
-            return;
-        }
-        // If no matching was done, write into book
-        let inserter = |book: &mut BTreeMap<i32, Vec<order::Order>>, order: order::Order| {
-            let bucket = book.get_mut(&order.price);
-            match bucket {
-                Some(v) => v.push(order),
-                None => {
-                    book.insert(order.price, vec![order]);
-                }
-            }
-        };
-        match order.side {
-            order::Side::Buy => {
-                inserter(&mut self.bid_book, order);
-                self.update_highest_bid();
-            }
-            order::Side::Sell => {
-                inserter(&mut self.ask_book, order);
-                self.update_lowest_ask();
-            }
-        }
-    }
-
     /// Checks if an order would cross the book
     ///
     /// # Args
@@ -176,92 +272,6 @@ impl OrderBook {
                 None => false,
             },
         }
-    }
-
-    /// Try to trade buy order
-    ///
-    /// # Args
-    /// - `buy_order`: Buy order offered to trade
-    ///
-    /// # Return
-    /// - True if trade was performed, false otherwise
-    fn trade_buy_order(&mut self, buy_order: &order::Order) -> bool {
-        let mut order_traded = false;
-        // TODO how to avoid key_to_be_removed?
-        let mut key_to_be_removed: Option<i32> = None;
-        if let Some(bucket) = self.ask_book.iter_mut().next() {
-            let sell_order_pos = bucket
-                .1
-                .iter()
-                .position(|x| x.price <= buy_order.price && x.qty == buy_order.qty);
-            if let Some(pos) = sell_order_pos {
-                order_traded = true;
-                let sell_order = &bucket.1[pos];
-                self.log_sender
-                    .send(format!(
-                        "T, {}, {}, {}, {}, {}, {}",
-                        buy_order.user,
-                        buy_order.user_order_id,
-                        sell_order.user,
-                        sell_order.user_order_id,
-                        sell_order.price,
-                        sell_order.qty
-                    ))
-                    .unwrap();
-                bucket.1.remove(pos);
-                if bucket.1.is_empty() {
-                    key_to_be_removed = Some(*bucket.0);
-                }
-            }
-        }
-        if let Some(key) = key_to_be_removed {
-            self.ask_book.remove(&key);
-        }
-        self.update_lowest_ask();
-        order_traded
-    }
-
-    /// Try to trade sell order
-    ///
-    /// # Args
-    /// - `sell_order`: Buy order offered to trade
-    ///
-    /// # Return
-    /// - True if trade was performed, false otherwise
-    fn trade_sell_order(&mut self, sell_order: &order::Order) -> bool {
-        let mut order_traded = false;
-        // TODO how to avoid key_to_be_removed?
-        let mut key_to_be_removed: Option<i32> = None;
-        if let Some(bucket) = self.bid_book.iter_mut().next_back() {
-            let sell_order_pos = bucket
-                .1
-                .iter()
-                .position(|x| x.price >= sell_order.price && x.qty == sell_order.qty);
-            if let Some(pos) = sell_order_pos {
-                order_traded = true;
-                let buy_order = &bucket.1[pos];
-                self.log_sender
-                    .send(format!(
-                        "T, {}, {}, {}, {}, {}, {}",
-                        buy_order.user,
-                        buy_order.user_order_id,
-                        sell_order.user,
-                        sell_order.user_order_id,
-                        sell_order.price,
-                        sell_order.qty
-                    ))
-                    .unwrap();
-                bucket.1.remove(pos);
-                if bucket.1.is_empty() {
-                    key_to_be_removed = Some(*bucket.0);
-                }
-            }
-        }
-        if let Some(key) = key_to_be_removed {
-            self.ask_book.remove(&key);
-        }
-        self.update_lowest_ask();
-        order_traded
     }
 
     /// Process a cancel order
